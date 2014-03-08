@@ -1,2 +1,6 @@
 .coverage
 *.py[co]
+.Python
+bin/
+include/
+lib/

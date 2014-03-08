@@ -5,19 +5,20 @@
 import os
 from os.path import join
 import re
+
 from itertools import chain
-
-
+from functools import partial
 from tempfile import SpooledTemporaryFile
 
 import boto
 from boto.s3.key import Key
 
-from splicer import Schema, Field
+from splicer import Relation, Schema
+from splicer.ast import And, Const, BinaryOp, Function, Or, Tuple,Var, SelectionOp
 from splicer.path import pattern_regex
-from splicer import codecs
+from splicer.adapters import Adapter
 
-class S3Adapter(object):
+class S3Adapter(Adapter):
   def __init__(self, **relations):
     self._relations = {
       name:S3Table(name, **args) for name,args in relations.items()
@@ -32,6 +33,38 @@ class S3Adapter(object):
 
   def get_relation(self, name):
     return self._relations.get(name)
+
+  def has(self, name):
+    return name in self._relations
+
+  def evaluate(self, loc):
+    name = loc.node().name
+    relation = self._relations[name]
+
+    loc = loc.replace(
+      lambda ctx: s3_keys(
+        relation.bucket_name, 
+        relation.prefix,
+        relation.delimiter,
+        relation.validate_url_for
+      )
+    )
+
+    if relation.pattern:
+      loc = loc.replace(
+        Function(
+          'extract_path', 
+          loc.node(), 
+          Const(relation.root() + relation.pattern),
+          Const('url')
+        )
+      )
+
+    #todo rewrite select queries, also update prefix with where parameters if
+    # possible
+    return loc.leftmost_descendant()
+
+
 
 class S3File(object):
   def __init__(self, bucket, path):
@@ -58,10 +91,27 @@ class S3File(object):
 class S3Table(object):
   def __init__(self,  name, bucket,  **options):
 
+
     # todo: allow setting by url and use AWS_KEYS and Secrets
-    self.bucket = boto.connect_s3().get_bucket(bucket)
+    self.anon = options.pop('anon', False)
+    if self.anon:
+      self.validate_url_for = None
+    else:
+      self.validate_url_for = 60*60*24
+
+    self.connection = boto.connect_s3(
+      anon = self.anon,
+      is_secure = options.pop('is_secure', True)
+    ) 
+
+    self.bucket_name = bucket
+
     self.name = name
+
+
+
     self.delimiter=options.pop('delimiter','/')
+    
 
     prefix = options.pop('prefix', '/')
     if not prefix.endswith(self.delimiter):
@@ -70,18 +120,7 @@ class S3Table(object):
 
     self.marker = options.pop('marker', None)
 
-    pattern = options.pop('pattern', None)
-    if pattern:
-      while pattern.startswith(self.delimiter):
-        pattern = pattern[len(self.delimiter):]
-
-      self.pattern_regex, self.pattern_columns = pattern_regex(
-        self.prefix + pattern
-      )
-
-    else:
-      self.pattern_regex = None
-      self.pattern_columns = []
+    self.pattern = options.pop('pattern', None)
 
     self.content_column = options.pop('content_column', None)
     self.filename_column = options.pop('filename_column', None)
@@ -95,133 +134,53 @@ class S3Table(object):
     if options:
       raise ValueError("Unrecognized options {}".format(options.keys()))
 
-
-  @property
-  def schema(self):
-    if self._schema is None:
-      fields = [
-        Field(name=name, type="STRING") for name in self.pattern_columns
-      ]
-
-      if self.content_column:
-        fields.append(Field(name=self.content_column, type='BINARY'))
-
-      if self.filename_column:
-        fields.append(Field(name=self.filename_column, type='STRING'))
-
-      if self.decode != "none":
-        fields.extend(
-          self.fields_from_content(self.decode)
-        )
-      self._schema = Schema(name=self.name, fields=fields)
+  def root(self):
+    return http_url(self.connection,self.bucket_name, self.prefix)
 
 
-    return self._schema
 
 
-  def keys(self):
-    return self.bucket.list(self.prefix, marker=self.marker)
-    #return (
-    #  join(root,f)
-    #  for root, dirs, files in os.walk(self.root_dir)
-    #  for f in files
-    #)
-
-  def match_info(self):
-    """
-    Returns: tuple((<extracted1>,...,<extractedX>), path)
-    for each file that matches the FileTable's pattern_regex.
-    If no regex is specified returns tuple((), path) for all
-    files under the root_dir.
-
-    """
-
-    if not self.pattern_regex:
-      for key in self.keys():
-        yield (), key.name
-    else:
-      for key in self.keys():
-        m = self.pattern_regex.match(key.name)
-        if m:
-          yield m.groups(), key.name
-
-
-  def fields_from_content(self, decode):
-    """
-    Returns the schema for the first matching file
-    under the root_dir.
-    """
-
-    try:
-      partition_data, path  = self.match_info().next()
-    except StopIteration:
-      return []
-
-    stream = S3File(self.bucket, path)
-
-    relation = codecs.relation_from(stream, decode)
-    if relation:
-      return relation.schema.fields
-    else:
-      # todo: consider defaulting to 'application/octet-stream'
-      return []
-
-  def extract_function(self):
-    """
-    Returns a function that will extract the data from a
-    file path.
-    """
-
-    def identity(partition_info, path):
-      yield partition_info
-
-    funcs = [identity]
+def s3_keys(bucket_name, prefix, delimiter, validate_url_for):
+  conn   = boto.connect_s3(anon=True)
+  bucket = conn.get_bucket(bucket_name)
+  
+  generate_url = generate_url_func(validate_url_for)
+  return Relation(
+    Schema([dict(name='url',type="STRING")]),
+    (
+      (generate_url(key),)
+      for key in bucket.list(prefix=prefix)
+    )
+  )
 
  
-    if self.filename_column:
-      def filename(partition_info, path):
-        yield  partition_info + (path,)
+def http_url(conn, bucket_name, path=''):
+  return conn.calling_format.build_url_base(
+    conn, 
+    conn.protocol,
+    conn.server_name(conn.port),
+    bucket_name,
+    path
+  )
 
-      funcs.append(filename)
 
-    if self.decode != "none":
-      def decode(partition_info, path):
-        stream = S3File(self.bucket, path)
+def generate_anon_url(key, protocol):
+  conn = key.bucket.connection
+  return conn.calling_format.build_url_base(
+    conn, 
+    protocol,
+    conn.server_name(conn.port),
+    key.bucket.name, key.key
+  )
 
-        relation = codecs.relation_from(stream, self.decode)
-        return (
-          partition_info + tuple(row)
-          for row in relation
-        )
-      funcs.append(decode)
-
-    if len(funcs) == 1:
-      return funcs[0]
-
-    def extract(partition_info, path):
-      """
-      Return one or more rows by composing the functions.
-      """
-
-      rows = funcs[0](partition_info,path)
-
-      for f in funcs[1:]:
-        rows = chain(*(
-          iter(f(row, path))
-          for row in rows
-        ))
-
-      return rows
-
-    return extract
+def generate_url_func(validate_url_for, force_http=False):
+  if validate_url_for is not None:
+    return lambda key: key.generate_url(validate_url_for, force_http=force_http)
+  else:
+    protocol = 'http' if force_http else 'https'
+    return lambda key: generate_anon_url(key, protocol)
 
 
 
-  def __iter__(self):
-    extract = self.extract_function()
-
-    for partition_info, path in self.match_info():
-      for row in extract(partition_info, path):
-        yield row
 
 

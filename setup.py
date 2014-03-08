@@ -35,9 +35,5 @@ setup(
     'boto'
   ],
  
-  setup_requires=[
-    'nose',
-    'coverage'
-  ],
   test_suite = 'nose.collector'
 )

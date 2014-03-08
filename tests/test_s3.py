@@ -1,32 +1,39 @@
-from splicer.ast import *
-from splicer.operations import visit
+from functools import partial
+from StringIO import StringIO
 from datetime import datetime
 
-def test_s3():
+from nose.tools import *
+from splicer.ast import *
+from splicer.operations import query_zipper
 
-  # select logs greater than may 31 2013
-  op = SelectionOp(
-    LoadOp('logs'), 
-    GtOp(Var('timestamp'), datetime(2013,5,31))
+from splicer_aws.s3_adapter import S3Adapter
+
+
+def test_evaluate():
+  adapter = S3Adapter(
+    logs = dict(
+      bucket = "aws-publicdatasets",
+      anon = True,
+      prefix = "/common-crawl/",
+      pattern = "{timestamp}/{server}"
+    )
   )
 
+  relation = adapter.get_relation('logs')
 
+  op = LoadOp('logs')
+  loc = query_zipper(op).leftmost_descendant()
+  
+  res = adapter.evaluate(loc)
 
-  # Selecting only the timestamp column should
-  # not decode the payload
-  ProjectionOp(op, Var('timestamp'))
+  import pdb; pdb.set_trace()
 
-  # Selecting columns inside the payload
-  # should be handled by splicer as it'll be done
-  # locally in memory by the machine
-  ProjectionOp(op, Var('timestamp'), Var('host'))
-
-  # No Support for joins
-
-  JoinOp(
-    LoadOp('customer_ids'),
-    ProjectionOp(op, Var('timestamp'), Var('host'))
+  eq_(
+    res.root(),
+    Function('s3_keys', Const(relation.bucket_name), Const(relation.prefix))
   )
+  
+
 
 
 
