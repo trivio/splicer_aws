@@ -1,0 +1,6 @@
+# versions of boto higher than 2.14.0 have broken anonymous support
+boto<2.14.0
+nose
+coverage
+splicer >= 0.1.0
+-e .
